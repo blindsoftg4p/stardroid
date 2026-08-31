@@ -1,0 +1,30 @@
+# Build artifacts / large binaries (kept out of git)
+android_tools.zip
+gradle.zip
+node_modules/
+.gradle/
+gradle_dist/
+android_sdk/
+local.properties
+
+# Android / Gradle
+*.iml
+.DS_Store
+/build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Node
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+Thumbs.db
+
+# Compiled build output (added after review)
+app/build/
+app/.cxx/
+**/build/

@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "antigravity": "^0.0.0",
+    "ws": "^8.21.0"
+  }
+}
