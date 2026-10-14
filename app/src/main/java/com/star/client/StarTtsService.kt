@@ -4,9 +4,9 @@ import android.speech.tts.SynthesisCallback
 import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
 import android.speech.tts.TextToSpeechService
+import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.util.*
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class WavHeaderInfo(
@@ -14,13 +14,12 @@ class WavHeaderInfo(
     val channels: Int,
     val bitsPerSample: Int,
     val pcmDataOffset: Int,
-    val pcmDataSize: Int
+    val pcmDataSize: Long
 )
 
 class StarTtsService : TextToSpeechService() {
+    private val logTag = "StarTtsService"
     private lateinit var starManager: StarManager
-    private val activeLatches = java.util.concurrent.ConcurrentHashMap.newKeySet<CountDownLatch>()
-
     override fun onCreate() {
         super.onCreate()
         starManager = StarManager.getInstance(this)
@@ -39,54 +38,70 @@ class StarTtsService : TextToSpeechService() {
     }
 
     override fun onStop() {
-        activeLatches.forEach { it.countDown() }
-        activeLatches.clear()
+        activeEvents.forEach { it.offer(SynthesisEvent.Cancelled) }
+        activeEvents.clear()
     }
 
     private fun parseWav(data: ByteArray): WavHeaderInfo? {
         if (data.size < 44) return null
-        if (data[0] != 'R'.code.toByte() || data[1] != 'I'.code.toByte() || data[2] != 'F'.code.toByte() || data[3] != 'F'.code.toByte()) {
-            return null
-        }
-        if (data[8] != 'W'.code.toByte() || data[9] != 'A'.code.toByte() || data[10] != 'V'.code.toByte() || data[11] != 'E'.code.toByte()) {
-            return null
-        }
-        
-        // Find "fmt " chunk
+        // RIFF magic
+        if (data[0] != 'R'.code.toByte() || data[1] != 'I'.code.toByte() ||
+            data[2] != 'F'.code.toByte() || data[3] != 'F'.code.toByte()) return null
+        // WAVE magic
+        if (data[8] != 'W'.code.toByte() || data[9] != 'A'.code.toByte() ||
+            data[10] != 'V'.code.toByte() || data[11] != 'E'.code.toByte()) return null
+
+        // Scan for "fmt " chunk
         var fmtOffset = -1
-        for (i in 12 until data.size - 8) {
-            if (data[i] == 'f'.code.toByte() && data[i+1] == 'm'.code.toByte() && data[i+2] == 't'.code.toByte() && data[i+3] == ' '.code.toByte()) {
+        var i = 12
+        while (i <= data.size - 8) {
+            if (data[i]   == 'f'.code.toByte() && data[i+1] == 'm'.code.toByte() &&
+                data[i+2] == 't'.code.toByte() && data[i+3] == ' '.code.toByte()) {
                 fmtOffset = i
                 break
             }
+            i++
         }
         if (fmtOffset == -1) return null
-        
-        val channels = readWord(data, fmtOffset + 8)
-        val sampleRate = readDword(data, fmtOffset + 10)
-        val bitsPerSample = readWord(data, fmtOffset + 22)
-        
-        // Find "data" chunk
+
+        // fmt chunk layout (offsets relative to chunk start):
+        //  +0  "fmt "  (4 bytes)
+        //  +4  chunk size (4 bytes LE)
+        //  +8  audio format (2 bytes)  — 1 = PCM
+        //  +10 num channels (2 bytes)
+        //  +12 sample rate  (4 bytes)
+        //  +16 byte rate    (4 bytes)
+        //  +18 block align  (2 bytes)
+        //  +22 bits/sample  (2 bytes)
+        val channels      = readWord (data, fmtOffset + 10)
+        val sampleRate    = readDword(data, fmtOffset + 12)
+        val bitsPerSample = readWord (data, fmtOffset + 22)
+
+        // Scan for "data" chunk
         var dataOffset = -1
-        for (i in (fmtOffset + 8) until data.size - 8) {
-            if (data[i] == 'd'.code.toByte() && data[i+1] == 'a'.code.toByte() && data[i+2] == 't'.code.toByte() && data[i+3] == 'a'.code.toByte()) {
-                dataOffset = i
+        var j = fmtOffset + 8
+        while (j <= data.size - 8) {
+            if (data[j]   == 'd'.code.toByte() && data[j+1] == 'a'.code.toByte() &&
+                data[j+2] == 't'.code.toByte() && data[j+3] == 'a'.code.toByte()) {
+                dataOffset = j
                 break
             }
+            j++
         }
         if (dataOffset == -1) return null
-        
-        val pcmDataSize = readDword(data, dataOffset + 4)
+
+        val pcmDataSize   = readDword(data, dataOffset + 4).toLong()
         val pcmDataOffset = dataOffset + 8
-        
+
         return WavHeaderInfo(
-            sampleRate = sampleRate,
-            channels = channels,
+            sampleRate    = sampleRate,
+            channels      = channels,
             bitsPerSample = bitsPerSample,
             pcmDataOffset = pcmDataOffset,
-            pcmDataSize = pcmDataSize
+            pcmDataSize   = pcmDataSize
         )
     }
+
 
     private fun readWord(data: ByteArray, offset: Int): Int {
         return (data[offset].toInt() and 0xFF) or ((data[offset + 1].toInt() and 0xFF) shl 8)
@@ -99,85 +114,157 @@ class StarTtsService : TextToSpeechService() {
                ((data[offset + 3].toInt() and 0xFF) shl 24)
     }
 
+    private sealed class SynthesisEvent {
+        data class Audio(val bytes: ByteArray) : SynthesisEvent()
+        data class Status(val value: StatusMessage) : SynthesisEvent()
+        object Cancelled : SynthesisEvent()
+    }
+
+    private val activeEvents = java.util.concurrent.ConcurrentHashMap.newKeySet<java.util.concurrent.BlockingQueue<SynthesisEvent>>()
+
     override fun onSynthesizeText(request: SynthesisRequest, callback: SynthesisCallback) {
         val text = request.charSequenceText.toString()
-        val voice = starManager.selectedVoice.value ?: starManager.voices.value.firstOrNull()
-        
+        val preferredVoice = starManager.selectedVoice.value
+        val voiceDeadline = System.currentTimeMillis() + 30_000L
+        var voice: StarVoice? = null
+
+        while (System.currentTimeMillis() < voiceDeadline) {
+            val states = starManager.connectionStates.value
+            voice = when {
+                preferredVoice != null && states[preferredVoice.serverUrl] == ConnState.CONNECTED -> preferredVoice
+                preferredVoice == null -> starManager.voices.value.firstOrNull { states[it.serverUrl] == ConnState.CONNECTED }
+                else -> starManager.voices.value.firstOrNull {
+                    it.name == preferredVoice.name && states[it.serverUrl] == ConnState.CONNECTED
+                }
+            }
+            if (voice != null) break
+            try { Thread.sleep(200) } catch (_: InterruptedException) {
+                callback.error()
+                return
+            }
+        }
+
         if (voice == null) {
+            Log.e(logTag, "No connected server has the selected voice")
             callback.error()
             return
         }
 
-        val latch = CountDownLatch(1)
-        activeLatches.add(latch)
+        val events = java.util.concurrent.LinkedBlockingQueue<SynthesisEvent>()
+        activeEvents.add(events)
         var started = false
-        var expectedBytes = -1
-        var receivedBytes = 0
+        var expectedBytes = -1L
+        var receivedBytes = 0L
+        val initialAudio = ByteArrayOutputStream()
+        var pcmFrameBytes = 2
+        var requestId: String? = null
+
+        fun startAudio(sampleRate: Int, encoding: Int, channels: Int) {
+            val result = callback.start(sampleRate, encoding, channels)
+            if (result != TextToSpeech.SUCCESS) throw IllegalStateException("TTS callback rejected audio start: $result")
+            pcmFrameBytes = (if (encoding == android.media.AudioFormat.ENCODING_PCM_8BIT) 1 else 2) * channels
+            started = true
+        }
+
+        fun writeAudio(bytes: ByteArray, offset: Int, length: Int) {
+            if (length <= 0) return
+            val maxBufferSize = callback.maxBufferSize
+            val chunkLimit = maxBufferSize - (maxBufferSize % pcmFrameBytes)
+            if (chunkLimit <= 0) throw IllegalStateException("TTS callback buffer is too small")
+            var position = offset
+            val end = offset + length
+            while (position < end) {
+                val count = minOf(chunkLimit, end - position)
+                val result = callback.audioAvailable(bytes, position, count)
+                if (result != TextToSpeech.SUCCESS) throw IllegalStateException("TTS callback rejected audio: $result")
+                position += count
+            }
+            receivedBytes += length
+        }
 
         try {
-            starManager.requestTts(voice, text,
-                onAudioReceived = { frag, data ->
-                    if (data.isEmpty()) return@requestTts
-                    try {
+            requestId = starManager.requestTts(voice, text,
+                onAudioReceived = { _, data -> events.offer(SynthesisEvent.Audio(data)) },
+                onStatusReceived = { status -> events.offer(SynthesisEvent.Status(status)) }
+            )
+            if (requestId == null) {
+                Log.e(logTag, "Could not dispatch synthesis request")
+                callback.error()
+                return
+            }
+            Log.i(logTag, "Dispatched synthesis request ${requestId!!}")
+
+            val deadline = System.currentTimeMillis() + 20_000L
+            while (true) {
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) {
+                    Log.e(logTag, "Synthesis request timed out")
+                    callback.error()
+                    return
+                }
+                when (val event = events.poll(remaining, TimeUnit.MILLISECONDS)) {
+                    null -> {
+                        Log.e(logTag, "Synthesis request timed out")
+                        callback.error()
+                        return
+                    }
+                    is SynthesisEvent.Cancelled -> return
+                    is SynthesisEvent.Status -> {
+                        val status = event.value
+                        Log.w(logTag, "Server status for request ${requestId!!}: ${status.status ?: "unspecified"}")
+                        if (status.abort == true || status.status?.lowercase(Locale.US)?.contains("error") == true) {
+                            Log.e(logTag, "Synthesis request failed: ${status.status ?: "aborted"}")
+                            callback.error()
+                            return
+                        }
+                        if (status.status?.lowercase(Locale.US)?.let { it.contains("done") || it.contains("completed") } == true) {
+                            if (started) callback.done() else callback.error()
+                            return
+                        }
+                    }
+                    is SynthesisEvent.Audio -> {
+                        val data = event.bytes
+                        if (data.isEmpty()) continue
+                        Log.d(logTag, "Received ${data.size} audio bytes for request ${requestId!!}")
                         if (!started) {
-                            val wavInfo = parseWav(data)
-                            if (wavInfo != null) {
-                                val sampleRate = wavInfo.sampleRate
-                                val channels = wavInfo.channels
-                                val encoding = if (wavInfo.bitsPerSample == 8) {
-                                    android.media.AudioFormat.ENCODING_PCM_8BIT
-                                } else {
-                                    android.media.AudioFormat.ENCODING_PCM_16BIT
-                                }
-                                callback.start(sampleRate, encoding, channels)
-                                started = true
-                                expectedBytes = wavInfo.pcmDataSize
-                                
-                                val offset = wavInfo.pcmDataOffset
-                                if (data.size > offset) {
-                                    val pcmData = data.sliceArray(offset until data.size)
-                                    callback.audioAvailable(pcmData, 0, pcmData.size)
-                                    receivedBytes += pcmData.size
-                                }
+                            initialAudio.write(data)
+                            val buffered = initialAudio.toByteArray()
+                            val isWav = buffered.size >= 4 && buffered[0] == 'R'.code.toByte() &&
+                                buffered[1] == 'I'.code.toByte() && buffered[2] == 'F'.code.toByte() && buffered[3] == 'F'.code.toByte()
+                            val wav = parseWav(buffered)
+                            if (wav == null && isWav) continue
+                            if (wav != null) {
+                                val encoding = if (wav.bitsPerSample == 8) android.media.AudioFormat.ENCODING_PCM_8BIT
+                                    else android.media.AudioFormat.ENCODING_PCM_16BIT
+                                startAudio(wav.sampleRate, encoding, wav.channels)
+                                expectedBytes = wav.pcmDataSize
+                                writeAudio(buffered, wav.pcmDataOffset, buffered.size - wav.pcmDataOffset)
+                                initialAudio.reset()
                             } else {
-                                // Default fallback: 22050 Hz Mono 16-bit PCM
-                                callback.start(22050, android.media.AudioFormat.ENCODING_PCM_16BIT, 1)
-                                started = true
-                                callback.audioAvailable(data, 0, data.size)
-                                receivedBytes += data.size
+                                Log.w(logTag, "Audio has no WAV header; treating it as raw 22050 Hz mono PCM")
+                                startAudio(22050, android.media.AudioFormat.ENCODING_PCM_16BIT, 1)
+                                writeAudio(buffered, 0, buffered.size)
+                                initialAudio.reset()
                             }
                         } else {
-                            callback.audioAvailable(data, 0, data.size)
-                            receivedBytes += data.size
+                            writeAudio(data, 0, data.size)
                         }
-
-                        // Complete check based on WAV header size
-                        if (expectedBytes > 0 && receivedBytes >= expectedBytes) {
-                            latch.countDown()
+                        if (expectedBytes >= 0 && receivedBytes >= expectedBytes) {
+                            callback.done()
+                            return
                         }
-                    } catch (e: Exception) {
-                        callback.error()
-                        latch.countDown()
-                    }
-                },
-                onStatusReceived = { statusMsg ->
-                    if (statusMsg.abort == true || statusMsg.status?.lowercase(Locale.US)?.contains("error") == true) {
-                        callback.error()
-                        latch.countDown()
-                    } else if (statusMsg.status?.lowercase(Locale.US)?.contains("done") == true ||
-                               statusMsg.status?.lowercase(Locale.US)?.contains("completed") == true) {
-                        latch.countDown()
                     }
                 }
-            )
-
-            // Block synthesis thread with 30 seconds max timeout
-            latch.await(30, TimeUnit.SECONDS)
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            callback.error()
         } catch (e: Exception) {
+            Log.e(logTag, "Failed to deliver synthesized audio", e)
             callback.error()
         } finally {
-            activeLatches.remove(latch)
-            callback.done()
+            requestId?.let(starManager::clearTtsRequest)
+            activeEvents.remove(events)
         }
     }
 }

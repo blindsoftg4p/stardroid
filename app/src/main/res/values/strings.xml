@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">STAR Client</string>
     <string name="tts_service_name">STAR TTS</string>
+    <string name="tts_sample_text">This is a STAR text to speech sample.</string>
 </resources>
