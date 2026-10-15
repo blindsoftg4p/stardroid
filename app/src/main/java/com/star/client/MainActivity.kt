@@ -115,7 +115,7 @@ fun StarApp(
             value = serverUrl,
             onValueChange = { serverUrl = it },
             label = { Text("Coagulator URL") },
-            supportingText = { Text("Bare hosts default to wss:// (port 443). Use http://, https://, ws:// or wss:// and add an explicit port for LAN coagulators.") },
+            supportingText = { Text("Bare hosts use ws:// on port 7774. Use wss:// for TLS (port 443 by default), or add an explicit port. Tailscale encrypts traffic between devices; use TLS on networks outside your tailnet.") },
             modifier = Modifier.fillMaxWidth()
         )
 

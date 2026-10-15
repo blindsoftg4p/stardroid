@@ -194,22 +194,27 @@ class StarTtsService : TextToSpeechService() {
             }
             Log.i(logTag, "Dispatched synthesis request ${requestId!!}")
 
-            val deadline = System.currentTimeMillis() + 20_000L
+            // Coagulators may wait on remote providers before returning a complete audio frame.
+            // Use an inactivity timeout so slow replies are allowed and ongoing status/audio
+            // activity keeps the request alive.
+            val idleTimeoutMs = 120_000L
+            var lastActivity = System.currentTimeMillis()
             while (true) {
-                val remaining = deadline - System.currentTimeMillis()
+                val remaining = idleTimeoutMs - (System.currentTimeMillis() - lastActivity)
                 if (remaining <= 0) {
-                    Log.e(logTag, "Synthesis request timed out")
+                    Log.e(logTag, "Synthesis request timed out after $idleTimeoutMs ms without a response")
                     callback.error()
                     return
                 }
                 when (val event = events.poll(remaining, TimeUnit.MILLISECONDS)) {
                     null -> {
-                        Log.e(logTag, "Synthesis request timed out")
+                        Log.e(logTag, "Synthesis request timed out after $idleTimeoutMs ms without a response")
                         callback.error()
                         return
                     }
                     is SynthesisEvent.Cancelled -> return
                     is SynthesisEvent.Status -> {
+                        lastActivity = System.currentTimeMillis()
                         val status = event.value
                         Log.w(logTag, "Server status for request ${requestId!!}: ${status.status ?: "unspecified"}")
                         if (status.abort == true || status.status?.lowercase(Locale.US)?.contains("error") == true) {
@@ -223,6 +228,7 @@ class StarTtsService : TextToSpeechService() {
                         }
                     }
                     is SynthesisEvent.Audio -> {
+                        lastActivity = System.currentTimeMillis()
                         val data = event.bytes
                         if (data.isEmpty()) continue
                         Log.d(logTag, "Received ${data.size} audio bytes for request ${requestId!!}")
