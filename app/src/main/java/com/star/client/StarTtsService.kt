@@ -8,6 +8,7 @@ import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.util.*
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 
 class WavHeaderInfo(
     val sampleRate: Int,
@@ -124,6 +125,21 @@ class StarTtsService : TextToSpeechService() {
 
     override fun onSynthesizeText(request: SynthesisRequest, callback: SynthesisCallback) {
         val text = request.charSequenceText.toString()
+        if (text.isBlank()) {
+            // TalkBack and other clients can submit empty boundary/cue utterances.
+            // Complete them locally instead of asking the provider to synthesize nothing.
+            if (callback.start(22050, android.media.AudioFormat.ENCODING_PCM_16BIT, 1) == TextToSpeech.SUCCESS) {
+                callback.done()
+            } else {
+                callback.error()
+            }
+            return
+        }
+
+        // Android reports normal rate and pitch as 100. STAR providers use ten
+        // percent rate steps and five percent pitch steps around the default.
+        val rateOffset = ((request.speechRate - 100) / 10f).roundToInt().coerceIn(-5, 10)
+        val pitchOffset = ((request.pitch - 100) / 5f).roundToInt().coerceIn(-10, 20)
         val preferredVoice = starManager.selectedVoice.value
         val voiceDeadline = System.currentTimeMillis() + 30_000L
         var voice: StarVoice? = null
@@ -184,6 +200,8 @@ class StarTtsService : TextToSpeechService() {
 
         try {
             requestId = starManager.requestTts(voice, text,
+                rate = rateOffset,
+                pitch = pitchOffset,
                 onAudioReceived = { _, data -> events.offer(SynthesisEvent.Audio(data)) },
                 onStatusReceived = { status -> events.offer(SynthesisEvent.Status(status)) }
             )

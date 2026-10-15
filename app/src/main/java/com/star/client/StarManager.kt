@@ -198,13 +198,15 @@ class StarManager private constructor(private val context: Context) {
     fun requestTts(
         voice: StarVoice,
         text: String,
+        rate: Int = 0,
+        pitch: Int = 0,
         onAudioReceived: (Int, ByteArray) -> Unit,
         onStatusReceived: (StatusMessage) -> Unit
     ): String? {
         val requestId = nextRequestId()
         audioCallbacks[requestId] = onAudioReceived
         statusCallbacks[requestId] = onStatusReceived
-        val sent = clients[normalizeUrl(voice.serverUrl)]?.requestTts(voice.name, text, requestId) == true
+        val sent = clients[normalizeUrl(voice.serverUrl)]?.requestTts(voice.name, text, requestId, rate, pitch) == true
         if (!sent) {
             audioCallbacks.remove(requestId)
             statusCallbacks.remove(requestId)

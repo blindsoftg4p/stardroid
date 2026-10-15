@@ -217,8 +217,9 @@ class StarClient(private val serverUrl: String) {
         this.disconnectedListener = listener
     }
 
-    fun requestTts(voice: String, text: String, requestId: String): Boolean {
-        val request = UserRequest(user = USER_REVISION, request = "$voice: $text", id = requestId)
+    fun requestTts(voice: String, text: String, requestId: String, rate: Int = 0, pitch: Int = 0): Boolean {
+        val voiceMeta = if (rate == 0 && pitch == 0) voice else "$voice<r=$rate p=$pitch>"
+        val request = UserRequest(user = USER_REVISION, request = "$voiceMeta: $text", id = requestId)
         return webSocket?.send(json.encodeToString(UserRequest.serializer(), request)) == true
     }
 
